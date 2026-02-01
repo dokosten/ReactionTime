@@ -1,0 +1,25 @@
+# Claude Code
+.claude/
+
+# Build outputs
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+
+# Build directories
+build/
+out/
+x64/
+Debug/
+Release/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
