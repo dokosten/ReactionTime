@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Requires Visual Studio 2022 Build Tools. Build outputs go to `build/` (gitignored).
 
 ```batch
-cmd.exe /c "\"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat\" x64 >nul 2>&1 && cd /d I:\Projects\ReactionTime && if not exist build mkdir build && rc /fo build\resource.res resource.rc && cl /O2 /EHsc /DNDEBUG /Fo:build\ /Fe:build\ReactionTime.exe main.cpp build\resource.res user32.lib gdi32.lib winmm.lib msimg32.lib shell32.lib /link /SUBSYSTEM:WINDOWS"
+cmd.exe /c "\"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat\" x64 >nul 2>&1 && cd /d I:\Projects\ReactionTime && if not exist build mkdir build && rc /fo build\resource.res resource.rc && cl /O2 /EHsc /DNDEBUG /Fo:build\ /Fe:build\ReactionTime.exe main.cpp build\resource.res user32.lib gdi32.lib winmm.lib msimg32.lib shell32.lib xinput.lib /link /SUBSYSTEM:WINDOWS"
 ```
 
 **Important:** Kill any running `ReactionTime.exe` before building — the linker cannot overwrite a locked executable.

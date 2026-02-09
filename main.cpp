@@ -8,10 +8,12 @@
 #include <time.h>
 #include <math.h>
 #include <shellapi.h>
+#include <xinput.h>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "xinput.lib")
 
 // Game states
 enum GameState {
@@ -69,6 +71,13 @@ static int g_joyStartButton = -1;  // detected Start/Menu/Options button index
 // Controller type enum for button name display
 enum JoyType { JOY_GENERIC = 0, JOY_XBOX = 1, JOY_PLAYSTATION = 2, JOY_SWITCH = 3 };
 static JoyType g_joyType = JOY_GENERIC;
+
+// XInput state (for Steam-wrapped controllers and native Xbox)
+static bool g_useXInput = false;
+static int g_xinputPlayer = -1;
+static DWORD g_prevXInputButtons = 0;  // mapped to joyGetPosEx-compatible indices
+static int g_prevXInputPOVDir = -1;
+static int g_prevXInputStickDir = 0;
 
 // Gamepad POV (D-pad) sentinel codes
 static const int GAMEPAD_POV_UP    = 0x100;
@@ -337,6 +346,31 @@ static const char* GetMouseButtonName(int btn) {
         case 2: return "Middle Click";
         default: return "Unknown";
     }
+}
+
+// Convert XInput wButtons to joyGetPosEx-compatible button bitmask (Xbox layout)
+static DWORD XInputToJoyButtons(WORD xb) {
+    DWORD j = 0;
+    if (xb & XINPUT_GAMEPAD_A)              j |= (1u << 0);
+    if (xb & XINPUT_GAMEPAD_B)              j |= (1u << 1);
+    if (xb & XINPUT_GAMEPAD_X)              j |= (1u << 2);
+    if (xb & XINPUT_GAMEPAD_Y)              j |= (1u << 3);
+    if (xb & XINPUT_GAMEPAD_LEFT_SHOULDER)  j |= (1u << 4);
+    if (xb & XINPUT_GAMEPAD_RIGHT_SHOULDER) j |= (1u << 5);
+    if (xb & XINPUT_GAMEPAD_BACK)           j |= (1u << 6);
+    if (xb & XINPUT_GAMEPAD_START)          j |= (1u << 7);
+    if (xb & XINPUT_GAMEPAD_LEFT_THUMB)     j |= (1u << 8);
+    if (xb & XINPUT_GAMEPAD_RIGHT_THUMB)    j |= (1u << 9);
+    return j;
+}
+
+// Convert XInput D-pad buttons to POV direction (-1=centered, 0-3=up/right/down/left)
+static int XInputDpadToDirection(WORD xb) {
+    if (xb & XINPUT_GAMEPAD_DPAD_UP)    return 0;
+    if (xb & XINPUT_GAMEPAD_DPAD_RIGHT) return 1;
+    if (xb & XINPUT_GAMEPAD_DPAD_DOWN)  return 2;
+    if (xb & XINPUT_GAMEPAD_DPAD_LEFT)  return 3;
+    return -1;
 }
 
 // Convert POV hat angle to cardinal direction (-1=centered, 0-3=up/right/down/left)
@@ -1028,6 +1062,47 @@ static void OnPaint(HWND hwnd) {
         break;
     }
 
+    // Version text (top-right corner, subtle)
+    {
+        const char* version = "v0.1";
+        SelectObject(memDC, smallFont);
+        SetTextColor(memDC, RGB(255, 255, 255));
+        SetBkMode(memDC, TRANSPARENT);
+        SIZE vs;
+        GetTextExtentPoint32A(memDC, version, (int)strlen(version), &vs);
+        // Use AlphaBlend trick: draw to a tiny temp bitmap with alpha
+        // Simpler approach: just use a dim color that blends with any background
+        COLORREF versionColor = (g_state == STATE_TOO_EARLY) ? RGB(80, 70, 0) : RGB(255, 255, 255);
+        SetTextColor(memDC, versionColor);
+        // Draw with 30% opacity via a separate alpha-blended bitmap
+        HDC tmpDC = CreateCompatibleDC(memDC);
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = vs.cx + 16;
+        bmi.bmiHeader.biHeight = -(vs.cy + 8);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        void* bits = NULL;
+        HBITMAP tmpBmp = CreateDIBSection(tmpDC, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        HBITMAP oldTmp = (HBITMAP)SelectObject(tmpDC, tmpBmp);
+        // Copy background region so text blends correctly
+        int vx = cw - vs.cx - 16, vy = 8;
+        BitBlt(tmpDC, 0, 0, vs.cx + 16, vs.cy + 8, memDC, vx, vy, SRCCOPY);
+        // Draw text onto temp surface
+        SelectObject(tmpDC, smallFont);
+        SetTextColor(tmpDC, versionColor);
+        SetBkMode(tmpDC, TRANSPARENT);
+        TextOutA(tmpDC, 8, 4, version, (int)strlen(version));
+        // Alpha blend back at ~35% opacity
+        BLENDFUNCTION bf = {};
+        bf.BlendOp = AC_SRC_OVER;
+        bf.SourceConstantAlpha = 90;
+        AlphaBlend(memDC, vx, vy, vs.cx + 16, vs.cy + 8, tmpDC, 0, 0, vs.cx + 16, vs.cy + 8, bf);
+        SelectObject(tmpDC, oldTmp);
+        DeleteObject(tmpBmp);
+        DeleteDC(tmpDC);
+    }
+
     // Copy back buffer to screen
     BitBlt(hdc, 0, 0, cw, ch, memDC, 0, 0, SRCCOPY);
 
@@ -1391,48 +1466,149 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
-        // Poll gamepad via joyGetPosEx (works with PS5, Xbox, Switch Pro, etc.)
+        // Poll gamepad — try XInput first (Steam-wrapped, native Xbox), then joyGetPosEx (PS5/Switch direct)
         {
-            // Scan for a connected joystick if we don't have one (every 1 second)
             DWORD tickNow = GetTickCount();
-            if (g_joyId < 0 && (tickNow - g_joyScanTime) > 1000) {
+
+            // Scan for a controller if none found (every 1 second)
+            if (!g_useXInput && g_joyId < 0 && (tickNow - g_joyScanTime) > 1000) {
                 g_joyScanTime = tickNow;
-                UINT numDevs = joyGetNumDevs();
-                for (UINT i = 0; i < numDevs && i < 16; i++) {
-                    JOYINFOEX probe = {};
-                    probe.dwSize = sizeof(JOYINFOEX);
-                    probe.dwFlags = JOY_RETURNBUTTONS;
-                    if (joyGetPosEx(i, &probe) == JOYERR_NOERROR) {
-                        g_joyId = (int)i;
-                        g_prevJoyButtons = probe.dwButtons;
-                        g_prevJoyPOVDir = -1;
-                        // Detect controller type for correct Start button mapping
-                        // Xbox (DirectInput): button 7 = Start/Menu
-                        // PlayStation/Switch (DirectInput): button 9 = Options/+
-                        JOYCAPSA caps = {};
-                        g_joyType = JOY_GENERIC;
-                        g_joyStartButton = 9;  // default to PS/Switch mapping
-                        if (joyGetDevCapsA(i, &caps, sizeof(caps)) == JOYERR_NOERROR) {
-                            if (strstr(caps.szPname, "Xbox") || strstr(caps.szPname, "xbox") ||
-                                strstr(caps.szPname, "XBOX") || strstr(caps.szPname, "X-Box")) {
-                                g_joyType = JOY_XBOX;
-                                g_joyStartButton = 7;
-                            } else if (strstr(caps.szPname, "Pro Controller") ||
-                                       strstr(caps.szPname, "Nintendo") || strstr(caps.szPname, "Joy-Con")) {
-                                g_joyType = JOY_SWITCH;
-                            } else {
-                                // Default to PlayStation for DualShock/DualSense ("Wireless Controller" etc.)
-                                g_joyType = JOY_PLAYSTATION;
-                            }
-                        }
+
+                // Try XInput first (covers Steam Input and native Xbox controllers)
+                XINPUT_STATE xstate;
+                for (DWORD p = 0; p < 4; p++) {
+                    if (XInputGetState(p, &xstate) == ERROR_SUCCESS) {
+                        g_useXInput = true;
+                        g_xinputPlayer = (int)p;
+                        g_prevXInputButtons = XInputToJoyButtons(xstate.Gamepad.wButtons);
+                        g_prevXInputPOVDir = XInputDpadToDirection(xstate.Gamepad.wButtons);
+                        g_joyType = JOY_XBOX;
+                        g_joyStartButton = 7;
+                        InvalidateRect(g_hwnd, NULL, FALSE);
                         break;
                     }
                 }
-                // Repaint so button names update with detected controller type
-                if (g_joyId >= 0) InvalidateRect(g_hwnd, NULL, FALSE);
+
+                // If no XInput, try joyGetPosEx (PS5/Switch direct USB, generic DirectInput)
+                if (!g_useXInput) {
+                    UINT numDevs = joyGetNumDevs();
+                    for (UINT i = 0; i < numDevs && i < 16; i++) {
+                        JOYINFOEX probe = {};
+                        probe.dwSize = sizeof(JOYINFOEX);
+                        probe.dwFlags = JOY_RETURNBUTTONS;
+                        if (joyGetPosEx(i, &probe) == JOYERR_NOERROR) {
+                            g_joyId = (int)i;
+                            g_prevJoyButtons = probe.dwButtons;
+                            g_prevJoyPOVDir = -1;
+                            JOYCAPSA caps = {};
+                            g_joyType = JOY_GENERIC;
+                            g_joyStartButton = 9;
+                            if (joyGetDevCapsA(i, &caps, sizeof(caps)) == JOYERR_NOERROR) {
+                                if (strstr(caps.szPname, "Xbox") || strstr(caps.szPname, "xbox") ||
+                                    strstr(caps.szPname, "XBOX") || strstr(caps.szPname, "X-Box")) {
+                                    g_joyType = JOY_XBOX;
+                                    g_joyStartButton = 7;
+                                } else if (strstr(caps.szPname, "Pro Controller") ||
+                                           strstr(caps.szPname, "Nintendo") || strstr(caps.szPname, "Joy-Con")) {
+                                    g_joyType = JOY_SWITCH;
+                                } else {
+                                    g_joyType = JOY_PLAYSTATION;
+                                }
+                            }
+                            InvalidateRect(g_hwnd, NULL, FALSE);
+                            break;
+                        }
+                    }
+                }
             }
 
-            if (g_joyId >= 0) {
+            // --- XInput polling ---
+            if (g_useXInput && g_xinputPlayer >= 0) {
+                XINPUT_STATE xstate;
+                if (XInputGetState((DWORD)g_xinputPlayer, &xstate) == ERROR_SUCCESS) {
+                    DWORD buttons = XInputToJoyButtons(xstate.Gamepad.wButtons);
+                    DWORD newButtons = buttons & ~g_prevXInputButtons;
+                    int povDir = XInputDpadToDirection(xstate.Gamepad.wButtons);
+                    bool povEdge = (povDir >= 0 && povDir != g_prevXInputPOVDir);
+
+                    int pressed = -1;
+                    if (newButtons) {
+                        for (int i = 0; i < 32; i++) {
+                            if (newButtons & (1u << i)) { pressed = i; break; }
+                        }
+                    }
+                    if (pressed < 0 && povEdge) {
+                        pressed = GAMEPAD_POV_UP + povDir;
+                    }
+
+                    // Start button toggles menu (like ESC)
+                    if ((newButtons & (1u << 7)) && g_rebindingAction < 0) {
+                        ToggleMenu();
+                        newButtons &= ~(1u << 7);
+                    }
+
+                    if (pressed >= 0) {
+                        if (g_rebindingAction >= 0) {
+                            CaptureRebind(BIND_GAMEPAD, pressed);
+                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                            if (pressed == GAMEPAD_POV_UP) {
+                                NavigateMenu(-1);
+                            } else if (pressed == GAMEPAD_POV_DOWN) {
+                                NavigateMenu(1);
+                            } else if (!IsGamepadStartButton(pressed)) {
+                                ActivateSelectedButton();
+                            }
+                        } else {
+                            if (newButtons) {
+                                for (int i = 0; i < 32; i++) {
+                                    if (!(newButtons & (1u << i))) continue;
+                                    if (BindingMatches(g_bindReset, BIND_GAMEPAD, i))
+                                        HandleAction(0);
+                                    if (BindingMatches(g_bindClick, BIND_GAMEPAD, i))
+                                        HandleAction(1);
+                                }
+                            }
+                            if (povEdge) {
+                                int povCode = GAMEPAD_POV_UP + povDir;
+                                if (BindingMatches(g_bindReset, BIND_GAMEPAD, povCode))
+                                    HandleAction(0);
+                                if (BindingMatches(g_bindClick, BIND_GAMEPAD, povCode))
+                                    HandleAction(1);
+                            }
+                        }
+                    }
+                    g_prevXInputButtons = buttons;
+                    g_prevXInputPOVDir = povDir;
+
+                    // Thumbstick menu navigation
+                    // XInput: positive Y = up, negative Y = down
+                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                        const SHORT deadzone = 16384;
+                        int stickDir = 0;
+                        SHORT ly = xstate.Gamepad.sThumbLY;
+                        SHORT ry = xstate.Gamepad.sThumbRY;
+                        if (ly > deadzone || ry > deadzone) stickDir = -1;  // up
+                        else if (ly < -deadzone || ry < -deadzone) stickDir = 1;  // down
+                        if (stickDir != 0 && stickDir != g_prevXInputStickDir) {
+                            NavigateMenu(stickDir);
+                        }
+                        g_prevXInputStickDir = stickDir;
+                    } else {
+                        g_prevXInputStickDir = 0;
+                    }
+                } else {
+                    // XInput controller disconnected
+                    g_useXInput = false;
+                    g_xinputPlayer = -1;
+                    g_prevXInputButtons = 0;
+                    g_prevXInputPOVDir = -1;
+                    g_prevXInputStickDir = 0;
+                    g_joyStartButton = -1;
+                    g_joyType = JOY_GENERIC;
+                }
+            }
+            // --- joyGetPosEx polling (only when XInput is not active) ---
+            else if (g_joyId >= 0) {
                 JOYINFOEX joyInfo = {};
                 joyInfo.dwSize = sizeof(JOYINFOEX);
                 joyInfo.dwFlags = JOY_RETURNBUTTONS | JOY_RETURNPOV | JOY_RETURNY | JOY_RETURNR;
@@ -1443,7 +1619,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     int povDir = POVToDirection(joyInfo.dwPOV);
                     bool povEdge = (povDir >= 0 && povDir != g_prevJoyPOVDir);
 
-                    // Find first new press (button or POV) for rebinding
                     int pressed = -1;
                     if (newButtons) {
                         for (int i = 0; i < 32; i++) {
@@ -1451,14 +1626,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         }
                     }
                     if (pressed < 0 && povEdge) {
-                        pressed = GAMEPAD_POV_UP + povDir;  // 0x100 + 0..3
+                        pressed = GAMEPAD_POV_UP + povDir;
                     }
 
-                    // Check for Start/Menu/Options button to toggle menu (like ESC)
                     bool startPressed = (g_joyStartButton >= 0 && (newButtons & (1u << g_joyStartButton)) != 0);
                     if (startPressed && g_rebindingAction < 0) {
                         ToggleMenu();
-                        // Remove start from newButtons so it doesn't also trigger bindings
                         newButtons &= ~(1u << g_joyStartButton);
                     }
 
@@ -1466,7 +1639,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         if (g_rebindingAction >= 0) {
                             CaptureRebind(BIND_GAMEPAD, pressed);
                         } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
-                            // Menu navigation: D-pad Up/Down to navigate, any other button to activate
                             if (pressed == GAMEPAD_POV_UP) {
                                 NavigateMenu(-1);
                             } else if (pressed == GAMEPAD_POV_DOWN) {
@@ -1475,7 +1647,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 ActivateSelectedButton();
                             }
                         } else {
-                            // Check all new digital buttons
                             if (newButtons) {
                                 for (int i = 0; i < 32; i++) {
                                     if (!(newButtons & (1u << i))) continue;
@@ -1485,7 +1656,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                         HandleAction(1);
                                 }
                             }
-                            // Check POV hat (D-pad)
                             if (povEdge) {
                                 int povCode = GAMEPAD_POV_UP + povDir;
                                 if (BindingMatches(g_bindReset, BIND_GAMEPAD, povCode))
@@ -1498,17 +1668,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     g_prevJoyButtons = buttons;
                     g_prevJoyPOVDir = povDir;
 
-                    // Thumbstick menu navigation (left stick Y = dwYpos, right stick Y = dwRpos)
-                    // joyGetPosEx axes range 0-65535, center ~32768
+                    // Thumbstick menu navigation (joyGetPosEx: 0-65535, center ~32768)
                     if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
-                        const DWORD deadzone = 16384;  // ~25% of half-range
+                        const DWORD deadzone = 16384;
                         const DWORD center = 32768;
                         int stickDir = 0;
-                        // Left stick Y (dwYpos) or right stick Y (dwRpos)
                         if (joyInfo.dwYpos < center - deadzone || joyInfo.dwRpos < center - deadzone)
-                            stickDir = -1;  // up
+                            stickDir = -1;
                         else if (joyInfo.dwYpos > center + deadzone || joyInfo.dwRpos > center + deadzone)
-                            stickDir = 1;   // down
+                            stickDir = 1;
                         if (stickDir != 0 && stickDir != g_prevStickDir) {
                             NavigateMenu(stickDir);
                         }
@@ -1517,7 +1685,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         g_prevStickDir = 0;
                     }
                 } else {
-                    // Controller disconnected — rescan next cycle
                     g_joyId = -1;
                     g_prevJoyButtons = 0;
                     g_prevJoyPOVDir = -1;
