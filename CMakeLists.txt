@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Windows subsystem application (no console window)
-add_executable(ReactionTime WIN32 main.cpp)
+add_executable(ReactionTime WIN32 main.cpp resource.rc)
 
 # Link Windows libraries
 target_link_libraries(ReactionTime PRIVATE winmm)
