@@ -9,8 +9,12 @@
 #include <math.h>
 #include <shellapi.h>
 #include <xinput.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "xinput.lib")
@@ -24,7 +28,12 @@ enum GameState {
     STATE_TOO_EARLY,    // Clicked too early, showing message
     STATE_MENU,         // ESC menu overlay
     STATE_KEYBINDS,     // Keybinds configuration screen
-    STATE_ABOUT         // About screen
+    STATE_ABOUT,                // About screen
+    STATE_BENCHMARK_MENU,       // Benchmark sub-menu
+    STATE_BENCHMARK_CPU,        // Running CPU single-core benchmark
+    STATE_BENCHMARK_GPU,        // Running GPU benchmark
+    STATE_BENCHMARK_MULTICORE,  // Running CPU multi-core benchmark
+    STATE_BENCHMARK_RESULT      // Showing benchmark results
 };
 
 // UI Button
@@ -61,6 +70,30 @@ static int g_rebindingAction = -1;     // -1=none, 0=rebinding reset, 1=rebindin
 static LARGE_INTEGER g_rebindStartTime = {}; // timestamp when rebind mode was entered
 static char g_configPath[MAX_PATH] = {0};
 
+// Benchmark state
+static HANDLE g_benchThread = NULL;
+static volatile bool g_benchDone = false;
+static volatile bool g_benchCancel = false;
+static volatile LONGLONG g_benchOps = 0;
+static DWORD g_benchStartTick = 0;
+static double g_lastBenchScore = 0.0;  // result of last benchmark (Mops/s)
+static int g_lastBenchType = 0;        // 0=cpu, 1=gpu, 2=multicore
+static const DWORD BENCH_DURATION_MS = 10000;
+
+// Benchmark history
+static char g_benchHistoryPath[MAX_PATH] = {0};
+struct BenchHistoryEntry { char date[12]; double score; };
+static BenchHistoryEntry g_benchHistory[20] = {};
+static int g_benchHistoryCount = 0;
+
+// Multi-core benchmark
+#define MAX_BENCH_THREADS 64
+static HANDLE g_benchThreads[MAX_BENCH_THREADS] = {};
+static int g_benchThreadCount = 0;
+// Per-thread counters, padded to avoid false sharing (64-byte cache lines)
+struct alignas(64) PaddedCounter { volatile LONGLONG ops; };
+static PaddedCounter g_threadOps[MAX_BENCH_THREADS] = {};
+
 // Gamepad state (joyGetPosEx — works with PS5, Xbox, Switch Pro, etc.)
 static int g_joyId = -1;           // cached joystick ID, -1 = needs scan
 static DWORD g_joyScanTime = 0;    // last scan timestamp (GetTickCount)
@@ -92,6 +125,12 @@ static void InitConfigPath() {
     char* dot = strrchr(g_configPath, '.');
     if (dot) strcpy(dot, ".cfg");
     else strcat(g_configPath, ".cfg");
+
+    // Benchmark history path (next to executable)
+    GetModuleFileNameA(NULL, g_benchHistoryPath, MAX_PATH);
+    dot = strrchr(g_benchHistoryPath, '.');
+    if (dot) strcpy(dot, ".benchmarks");
+    else strcat(g_benchHistoryPath, ".benchmarks");
 }
 
 // Save keybinds to config file
@@ -153,6 +192,49 @@ static void LoadKeybinds() {
     }
 }
 
+// Save a benchmark result to history file
+static void SaveBenchResult(int type, double score) {
+    FILE* f = fopen(g_benchHistoryPath, "a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%d,%02d/%02d %02d:%02d,%.6f\n",
+        type, st.wMonth, st.wDay, st.wHour, st.wMinute, score);
+    fclose(f);
+}
+
+// Load benchmark history for a specific type (last 20, newest first)
+static void LoadBenchHistory(int type) {
+    g_benchHistoryCount = 0;
+    FILE* f = fopen(g_benchHistoryPath, "r");
+    if (!f) return;
+
+    // Read all matching entries into a temp buffer
+    BenchHistoryEntry all[1024];
+    int total = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) && total < 1024) {
+        int t;
+        char date[12];
+        double score;
+        if (sscanf(line, "%d,%11[^,],%lf", &t, date, &score) == 3 && t == type) {
+            strncpy(all[total].date, date, sizeof(all[total].date) - 1);
+            all[total].date[sizeof(all[total].date) - 1] = '\0';
+            all[total].score = score;
+            total++;
+        }
+    }
+    fclose(f);
+
+    // Take last 20, store newest first
+    int start = total > 20 ? total - 20 : 0;
+    int count = total - start;
+    for (int i = 0; i < count; i++) {
+        g_benchHistory[i] = all[start + count - 1 - i];
+    }
+    g_benchHistoryCount = count;
+}
+
 // UI state
 static POINT g_mousePos = {0, 0};
 static int g_hoveredButton = -1;
@@ -170,7 +252,11 @@ enum ButtonID {
     BTN_REBIND_CLICK,
     BTN_EMAIL,
     BTN_COPY_EMAIL,
-    BTN_CLOSE
+    BTN_CLOSE,
+    BTN_BENCHMARK,
+    BTN_BENCH_CPU,
+    BTN_BENCH_GPU,
+    BTN_BENCH_MULTICORE
 };
 
 // Colors
@@ -581,14 +667,16 @@ static void UpdateHoveredButton() {
     }
 }
 
-// Forward declaration
+// Forward declarations
 static void OnButtonClick(int id);
+static void CancelBenchmark();
 
 // Get ordered list of button IDs for the current menu state
 static int GetMenuButtonIds(int* ids, int maxIds) {
     int count = 0;
     switch (g_state) {
         case STATE_MENU:
+            if (count < maxIds) ids[count++] = BTN_BENCHMARK;
             if (count < maxIds) ids[count++] = BTN_KEYBINDS;
             if (count < maxIds) ids[count++] = BTN_ABOUT;
             if (count < maxIds) ids[count++] = BTN_QUIT;
@@ -600,6 +688,13 @@ static int GetMenuButtonIds(int* ids, int maxIds) {
             if (count < maxIds) ids[count++] = BTN_BACK;
             break;
         case STATE_ABOUT:
+        case STATE_BENCHMARK_RESULT:
+            if (count < maxIds) ids[count++] = BTN_BACK;
+            break;
+        case STATE_BENCHMARK_MENU:
+            if (count < maxIds) ids[count++] = BTN_BENCH_CPU;
+            if (count < maxIds) ids[count++] = BTN_BENCH_MULTICORE;
+            if (count < maxIds) ids[count++] = BTN_BENCH_GPU;
             if (count < maxIds) ids[count++] = BTN_BACK;
             break;
         default:
@@ -645,6 +740,22 @@ static void ActivateSelectedButton() {
 
 // Toggle menu open/close (same behavior as ESC key)
 static void ToggleMenu() {
+    if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) {
+        CancelBenchmark();
+        return;
+    }
+    if (g_state == STATE_BENCHMARK_MENU) {
+        g_state = STATE_MENU;
+        g_selectedButton = -1;
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return;
+    }
+    if (g_state == STATE_BENCHMARK_RESULT) {
+        g_state = STATE_BENCHMARK_MENU;
+        g_selectedButton = -1;
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return;
+    }
     if (g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
         g_state = STATE_MENU;
         g_selectedButton = -1;
@@ -758,6 +869,231 @@ static HICON CreateAppIcon(int size) {
     return icon;
 }
 
+// CPU benchmark thread: tight math loop (single-core)
+static DWORD WINAPI BenchmarkCPUThread(LPVOID) {
+    volatile double x = 1.0;
+    LONGLONG ops = 0;
+    while (true) {
+        x = sin(x) * cos(x) + sqrt(x + 1.0);
+        ops++;
+        if ((ops & 0xFFFF) == 0) {
+            g_benchOps = ops;
+            if (g_benchCancel) return 0;
+            if (GetTickCount() - g_benchStartTick >= BENCH_DURATION_MS) break;
+        }
+    }
+    g_benchOps = ops;
+    g_benchDone = true;
+    return 0;
+}
+
+// CPU multi-core benchmark thread: each thread writes to its own padded counter
+static DWORD WINAPI BenchmarkMulticoreThread(LPVOID param) {
+    int idx = (int)(intptr_t)param;
+    volatile double x = 1.0 + idx;
+    LONGLONG ops = 0;
+    while (true) {
+        x = sin(x) * cos(x) + sqrt(x + 1.0);
+        ops++;
+        if ((ops & 0xFFFF) == 0) {
+            g_threadOps[idx].ops = ops;
+            if (g_benchCancel) return 0;
+            if (GetTickCount() - g_benchStartTick >= BENCH_DURATION_MS) break;
+        }
+    }
+    g_threadOps[idx].ops = ops;
+    return 0;
+}
+
+// Multi-core coordinator thread: waits for all worker threads, then sums
+static DWORD WINAPI BenchmarkMulticoreCoordinator(LPVOID) {
+    WaitForMultipleObjects((DWORD)g_benchThreadCount, g_benchThreads, TRUE, INFINITE);
+    LONGLONG total = 0;
+    for (int i = 0; i < g_benchThreadCount; i++) {
+        total += g_threadOps[i].ops;
+        CloseHandle(g_benchThreads[i]);
+        g_benchThreads[i] = NULL;
+    }
+    g_benchOps = total;
+    g_benchDone = true;
+    return 0;
+}
+
+// GPU benchmark thread: D3D11 compute shader
+static DWORD WINAPI BenchmarkGPUThread(LPVOID) {
+    // HLSL compute shader — 512 iterations of sin*cos+sqrt per thread
+    static const char shaderSrc[] =
+        "RWStructuredBuffer<float> output : register(u0);\n"
+        "[numthreads(256,1,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "    float x = (float)id.x * 0.001f;\n"
+        "    float acc = 0.0f;\n"
+        "    [loop] for (int i = 0; i < 512; i++) {\n"
+        "        acc += sin(x) * cos(x) + sqrt(abs(x) + 1.0f);\n"
+        "        x += 0.01f;\n"
+        "    }\n"
+        "    output[id.x] = acc;\n"
+        "}\n";
+
+    const UINT NUM_GROUPS = 256;
+    const UINT THREADS_PER_GROUP = 256;
+    const UINT TOTAL_THREADS = NUM_GROUPS * THREADS_PER_GROUP;
+    const UINT OPS_PER_THREAD = 512;
+    const int BATCHES_PER_DISPATCH = 8;
+    const LONGLONG OPS_PER_DISPATCH = (LONGLONG)BATCHES_PER_DISPATCH * NUM_GROUPS * THREADS_PER_GROUP * OPS_PER_THREAD;
+
+    ID3D11Device* device = NULL;
+    ID3D11DeviceContext* ctx = NULL;
+    ID3D11ComputeShader* cs = NULL;
+    ID3D11Buffer* buf = NULL;
+    ID3D11UnorderedAccessView* uav = NULL;
+    ID3D11Query* query = NULL;
+    ID3DBlob* blob = NULL;
+    ID3DBlob* errBlob = NULL;
+
+    // Create D3D11 device (hardware GPU)
+    D3D_FEATURE_LEVEL fl;
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+        NULL, 0, D3D11_SDK_VERSION, &device, &fl, &ctx);
+    if (FAILED(hr)) goto fail;
+
+    // Compile compute shader
+    hr = D3DCompile(shaderSrc, sizeof(shaderSrc), "gpu_bench", NULL, NULL,
+        "CSMain", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errBlob);
+    if (errBlob) errBlob->Release();
+    if (FAILED(hr)) goto fail;
+
+    hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &cs);
+    blob->Release();
+    blob = NULL;
+    if (FAILED(hr)) goto fail;
+
+    // Create structured buffer + UAV
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = TOTAL_THREADS * sizeof(float);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        bd.StructureByteStride = sizeof(float);
+        hr = device->CreateBuffer(&bd, NULL, &buf);
+        if (FAILED(hr)) goto fail;
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = TOTAL_THREADS;
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        hr = device->CreateUnorderedAccessView(buf, &ud, &uav);
+        if (FAILED(hr)) goto fail;
+    }
+
+    // Create event query for GPU sync
+    {
+        D3D11_QUERY_DESC qd = {};
+        qd.Query = D3D11_QUERY_EVENT;
+        hr = device->CreateQuery(&qd, &query);
+        if (FAILED(hr)) goto fail;
+    }
+
+    // Benchmark loop
+    {
+        ctx->CSSetShader(cs, NULL, 0);
+        ctx->CSSetUnorderedAccessViews(0, 1, &uav, NULL);
+
+        LONGLONG ops = 0;
+        while (true) {
+            // Dispatch multiple batches before syncing
+            for (int b = 0; b < BATCHES_PER_DISPATCH; b++)
+                ctx->Dispatch(NUM_GROUPS, 1, 1);
+
+            // Wait for GPU to finish
+            ctx->End(query);
+            BOOL queryData = FALSE;
+            while (ctx->GetData(query, &queryData, sizeof(queryData), 0) == S_FALSE) {
+                if (g_benchCancel) { g_benchOps = 0; goto cleanup; }
+                Sleep(0);
+            }
+
+            ops += OPS_PER_DISPATCH;
+            g_benchOps = ops;
+
+            if (g_benchCancel) { g_benchOps = 0; goto cleanup; }
+            if (GetTickCount() - g_benchStartTick >= BENCH_DURATION_MS) break;
+        }
+        g_benchOps = ops;
+    }
+    goto cleanup;
+
+fail:
+    g_benchOps = 0;
+
+cleanup:
+    if (uav) uav->Release();
+    if (buf) buf->Release();
+    if (cs) cs->Release();
+    if (query) query->Release();
+    if (ctx) ctx->Release();
+    if (device) device->Release();
+
+    g_benchDone = true;
+    return 0;
+}
+
+// Start a specific benchmark (0=CPU, 1=GPU, 2=Multicore)
+static void StartBenchmarkType(int type) {
+    g_lastBenchType = type;
+    g_lastBenchScore = 0.0;
+    g_benchOps = 0;
+    g_benchDone = false;
+    g_benchCancel = false;
+    g_benchStartTick = GetTickCount();
+
+    if (type == 0) {
+        g_state = STATE_BENCHMARK_CPU;
+        g_benchThread = CreateThread(NULL, 0, BenchmarkCPUThread, NULL, 0, NULL);
+    } else if (type == 1) {
+        g_state = STATE_BENCHMARK_GPU;
+        g_benchThread = CreateThread(NULL, 0, BenchmarkGPUThread, NULL, 0, NULL);
+    } else {
+        g_state = STATE_BENCHMARK_MULTICORE;
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        g_benchThreadCount = (int)si.dwNumberOfProcessors;
+        if (g_benchThreadCount > MAX_BENCH_THREADS) g_benchThreadCount = MAX_BENCH_THREADS;
+        for (int i = 0; i < g_benchThreadCount; i++) {
+            g_threadOps[i].ops = 0;
+            g_benchThreads[i] = CreateThread(NULL, 0, BenchmarkMulticoreThread, (LPVOID)(intptr_t)i, 0, NULL);
+        }
+        // Coordinator thread waits for all workers and sets g_benchDone
+        g_benchThread = CreateThread(NULL, 0, BenchmarkMulticoreCoordinator, NULL, 0, NULL);
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// Cancel a running benchmark and return to benchmark menu
+static void CancelBenchmark() {
+    g_benchCancel = true;
+    if (g_benchThread) {
+        WaitForSingleObject(g_benchThread, 2000);
+        CloseHandle(g_benchThread);
+        g_benchThread = NULL;
+    }
+    // Clean up any multicore worker handles that coordinator didn't close
+    for (int i = 0; i < g_benchThreadCount; i++) {
+        if (g_benchThreads[i]) {
+            WaitForSingleObject(g_benchThreads[i], 500);
+            CloseHandle(g_benchThreads[i]);
+            g_benchThreads[i] = NULL;
+        }
+    }
+    g_benchThreadCount = 0;
+    g_benchCancel = false;
+    g_benchDone = false;
+    g_benchOps = 0;
+    g_state = STATE_BENCHMARK_MENU;
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
 // Paint the window
 static void OnPaint(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -783,6 +1119,11 @@ static void OnPaint(HWND hwnd) {
         case STATE_MENU:
         case STATE_KEYBINDS:
         case STATE_ABOUT:
+        case STATE_BENCHMARK_MENU:
+        case STATE_BENCHMARK_CPU:
+        case STATE_BENCHMARK_GPU:
+        case STATE_BENCHMARK_MULTICORE:
+        case STATE_BENCHMARK_RESULT:
             bgColor = COLOR_DARK_BG;
             break;
         case STATE_WAITING:
@@ -835,10 +1176,11 @@ static void OnPaint(HWND hwnd) {
             // Menu buttons
             int btnW = 280, btnH = 56, gap = 20;
             int startY = ch / 3 + 20 - 100;
-            DrawButton(memDC, centerX, startY, btnW, btnH, "KEYBINDS", BTN_KEYBINDS, btnFont);
-            DrawButton(memDC, centerX, startY + btnH + gap, btnW, btnH, "ABOUT", BTN_ABOUT, btnFont);
-            DrawButton(memDC, centerX, startY + 2 * (btnH + gap), btnW, btnH, "QUIT", BTN_QUIT, btnFont);
-            DrawButton(memDC, centerX, startY + 3 * (btnH + gap), btnW, btnH, "CLOSE", BTN_CLOSE, btnFont);
+            DrawButton(memDC, centerX, startY, btnW, btnH, "BENCHMARK", BTN_BENCHMARK, btnFont);
+            DrawButton(memDC, centerX, startY + btnH + gap, btnW, btnH, "KEYBINDS", BTN_KEYBINDS, btnFont);
+            DrawButton(memDC, centerX, startY + 2 * (btnH + gap), btnW, btnH, "ABOUT", BTN_ABOUT, btnFont);
+            DrawButton(memDC, centerX, startY + 3 * (btnH + gap), btnW, btnH, "QUIT", BTN_QUIT, btnFont);
+            DrawButton(memDC, centerX, startY + 4 * (btnH + gap), btnW, btnH, "CLOSE", BTN_CLOSE, btnFont);
 
             // Hint
             DrawCenteredText(memDC, "ESC = Return  |  Arrows/D-pad = Navigate  |  Enter/Gamepad = Select", ch - 60, smallFont, RGB(120, 120, 130));
@@ -964,6 +1306,188 @@ static void OnPaint(HWND hwnd) {
         }
         break;
 
+        case STATE_BENCHMARK_MENU:
+        {
+            DrawCenteredText(memDC, "Benchmark", ch / 5 - 100, titleFont, COLOR_ACCENT);
+
+            int btnW = 280, btnH = 56, gap = 20;
+            int startY = ch / 3 + 20 - 100;
+            DrawButton(memDC, centerX, startY, btnW, btnH, "CPU", BTN_BENCH_CPU, btnFont);
+            DrawButton(memDC, centerX, startY + btnH + gap, btnW, btnH, "CPU MULTICORE", BTN_BENCH_MULTICORE, btnFont);
+            DrawButton(memDC, centerX, startY + 2 * (btnH + gap), btnW, btnH, "GPU", BTN_BENCH_GPU, btnFont);
+            DrawButton(memDC, centerX, startY + 3 * (btnH + gap), btnW, btnH, "BACK", BTN_BACK, btnFont);
+
+            DrawCenteredText(memDC, "Each benchmark runs for 10 seconds", ch - 60, smallFont, RGB(120, 120, 130));
+        }
+        break;
+
+        case STATE_BENCHMARK_CPU:
+        case STATE_BENCHMARK_GPU:
+        case STATE_BENCHMARK_MULTICORE:
+        {
+            const char* title = "Testing CPU...";
+            if (g_state == STATE_BENCHMARK_GPU) title = "Testing GPU...";
+            else if (g_state == STATE_BENCHMARK_MULTICORE) title = "Testing CPU (all cores)...";
+            DrawCenteredText(memDC, title, ch / 4, titleFont, COLOR_ACCENT);
+
+            // Progress bar
+            DWORD elapsed = GetTickCount() - g_benchStartTick;
+            float progress = (float)elapsed / (float)BENCH_DURATION_MS;
+            if (progress > 1.0f) progress = 1.0f;
+            int barW = 400, barH = 30;
+            int barX = centerX - barW / 2;
+            int barY = ch / 2 - barH / 2;
+            // Bar background
+            HBRUSH barBgBrush = CreateSolidBrush(RGB(50, 50, 60));
+            RECT barBgRect = { barX, barY, barX + barW, barY + barH };
+            FillRect(memDC, &barBgRect, barBgBrush);
+            DeleteObject(barBgBrush);
+            // Bar fill
+            int fillW = (int)(barW * progress);
+            if (fillW > 0) {
+                HBRUSH barFillBrush = CreateSolidBrush(COLOR_ACCENT);
+                RECT barFillRect = { barX, barY, barX + fillW, barY + barH };
+                FillRect(memDC, &barFillRect, barFillBrush);
+                DeleteObject(barFillBrush);
+            }
+            // Bar border
+            HPEN barPen = CreatePen(PS_SOLID, 1, RGB(80, 80, 95));
+            HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+            SelectObject(memDC, barPen);
+            SelectObject(memDC, nullBr);
+            Rectangle(memDC, barX, barY, barX + barW, barY + barH);
+            DeleteObject(barPen);
+
+            // Animated spinner: 8 dots, one highlighted
+            {
+                int dotCount = 8;
+                int dotSize = 10;
+                int dotGap = 18;
+                int totalW = dotCount * dotSize + (dotCount - 1) * (dotGap - dotSize);
+                int dotStartX = centerX - totalW / 2;
+                int dotY = barY + barH + 30;
+                int activeIdx = (int)(GetTickCount() / 150) % dotCount;
+                for (int i = 0; i < dotCount; i++) {
+                    COLORREF dotColor = (i == activeIdx) ? COLOR_ACCENT : RGB(70, 70, 80);
+                    HBRUSH dotBrush = CreateSolidBrush(dotColor);
+                    HPEN dotPen = CreatePen(PS_NULL, 0, 0);
+                    SelectObject(memDC, dotBrush);
+                    SelectObject(memDC, dotPen);
+                    int dx = dotStartX + i * dotGap;
+                    Ellipse(memDC, dx, dotY, dx + dotSize, dotY + dotSize);
+                    DeleteObject(dotBrush);
+                    DeleteObject(dotPen);
+                }
+            }
+
+            // Stats
+            char statsBuf[128];
+            DWORD secs = elapsed / 1000;
+            snprintf(statsBuf, sizeof(statsBuf), "%d / %d seconds", secs > 10 ? 10 : secs, BENCH_DURATION_MS / 1000);
+            DrawCenteredText(memDC, statsBuf, ch / 2 + 80, mediumFont, COLOR_WHITE);
+
+            // Show live ops count (for multicore, sum all thread counters)
+            LONGLONG ops = g_benchOps;
+            if (g_state == STATE_BENCHMARK_MULTICORE) {
+                ops = 0;
+                for (int i = 0; i < g_benchThreadCount; i++)
+                    ops += g_threadOps[i].ops;
+            }
+            char opsBuf[128];
+            if (ops > 1000000) {
+                snprintf(opsBuf, sizeof(opsBuf), "%.1f M operations", (double)ops / 1000000.0);
+            } else {
+                snprintf(opsBuf, sizeof(opsBuf), "%lld operations", ops);
+            }
+            DrawCenteredText(memDC, opsBuf, ch / 2 + 120, smallFont, RGB(180, 180, 190));
+
+            // Show core count for multicore
+            if (g_state == STATE_BENCHMARK_MULTICORE) {
+                char coresBuf[64];
+                snprintf(coresBuf, sizeof(coresBuf), "%d threads", g_benchThreadCount);
+                DrawCenteredText(memDC, coresBuf, ch / 2 + 155, smallFont, RGB(150, 150, 160));
+            }
+
+            // Hint
+            DrawCenteredText(memDC, "ESC = Cancel", ch - 60, smallFont, RGB(120, 120, 130));
+        }
+        break;
+
+        case STATE_BENCHMARK_RESULT:
+        {
+            const char* label = "CPU";
+            if (g_lastBenchType == 1) label = "GPU";
+            else if (g_lastBenchType == 2) label = "CPU Multicore";
+
+            DrawCenteredText(memDC, "Benchmark Result", ch / 4, titleFont, COLOR_ACCENT);
+
+            char scoreBuf[128];
+            if (g_lastBenchScore >= 1.0) {
+                snprintf(scoreBuf, sizeof(scoreBuf), "%s:  %.2f Mops/s", label, g_lastBenchScore);
+            } else {
+                snprintf(scoreBuf, sizeof(scoreBuf), "%s:  %.2f Kops/s", label, g_lastBenchScore * 1000.0);
+            }
+            DrawCenteredText(memDC, scoreBuf, ch / 2 - 20, mediumFont, COLOR_WHITE);
+
+            DrawButton(memDC, centerX, ch / 2 + 60, 200, 56, "BACK", BTN_BACK, btnFont);
+
+            // Draw benchmark history (top-left, ~35% opacity like version text)
+            if (g_benchHistoryCount > 0) {
+                SelectObject(memDC, smallFont);
+                SetBkMode(memDC, TRANSPARENT);
+
+                // Measure line height
+                SIZE lineSize;
+                GetTextExtentPoint32A(memDC, "X", 1, &lineSize);
+                int lineH = lineSize.cy + 2;
+                int histX = 12, histY = 10;
+
+                // Measure max width for the temp bitmap
+                int maxW = 0;
+                char histLines[20][64];
+                for (int i = 0; i < g_benchHistoryCount; i++) {
+                    if (g_benchHistory[i].score >= 1.0)
+                        snprintf(histLines[i], 64, "%s  %.2f Mops/s", g_benchHistory[i].date, g_benchHistory[i].score);
+                    else
+                        snprintf(histLines[i], 64, "%s  %.2f Kops/s", g_benchHistory[i].date, g_benchHistory[i].score * 1000.0);
+                    SIZE s;
+                    GetTextExtentPoint32A(memDC, histLines[i], (int)strlen(histLines[i]), &s);
+                    if (s.cx > maxW) maxW = s.cx;
+                }
+
+                int totalW = maxW + 16;
+                int totalH = lineH * g_benchHistoryCount + 8;
+
+                HDC hDC = CreateCompatibleDC(memDC);
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = totalW;
+                bi.bmiHeader.biHeight = -totalH;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                void* hBits = NULL;
+                HBITMAP hBmp = CreateDIBSection(hDC, &bi, DIB_RGB_COLORS, &hBits, NULL, 0);
+                HBITMAP hOld = (HBITMAP)SelectObject(hDC, hBmp);
+                BitBlt(hDC, 0, 0, totalW, totalH, memDC, histX, histY, SRCCOPY);
+
+                SelectObject(hDC, smallFont);
+                SetTextColor(hDC, RGB(255, 255, 255));
+                SetBkMode(hDC, TRANSPARENT);
+                for (int i = 0; i < g_benchHistoryCount; i++) {
+                    TextOutA(hDC, 8, 4 + i * lineH, histLines[i], (int)strlen(histLines[i]));
+                }
+
+                BLENDFUNCTION hBf = {};
+                hBf.BlendOp = AC_SRC_OVER;
+                hBf.SourceConstantAlpha = 90;
+                AlphaBlend(memDC, histX, histY, totalW, totalH, hDC, 0, 0, totalW, totalH, hBf);
+                SelectObject(hDC, hOld);
+                DeleteObject(hBmp);
+                DeleteDC(hDC);
+            }
+        }
+        break;
+
         default:
         {
             // Game states — draw header with dynamic keybind display
@@ -1064,7 +1588,7 @@ static void OnPaint(HWND hwnd) {
 
     // Version text (top-right corner, subtle)
     {
-        const char* version = "v0.2";
+        const char* version = "v0.5";
         SelectObject(memDC, smallFont);
         SetTextColor(memDC, RGB(255, 255, 255));
         SetBkMode(memDC, TRANSPARENT);
@@ -1145,10 +1669,28 @@ static void OnButtonClick(int id) {
         case BTN_QUIT:
             PostQuitMessage(0);
             break;
+        case BTN_BENCHMARK:
+            g_state = STATE_BENCHMARK_MENU;
+            g_selectedButton = -1;
+            InvalidateRect(g_hwnd, NULL, FALSE);
+            break;
+        case BTN_BENCH_CPU:
+            StartBenchmarkType(0);
+            break;
+        case BTN_BENCH_GPU:
+            StartBenchmarkType(1);
+            break;
+        case BTN_BENCH_MULTICORE:
+            StartBenchmarkType(2);
+            break;
         case BTN_BACK:
             if (g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
                 g_state = STATE_MENU;
                 g_rebindingAction = -1;
+                InvalidateRect(g_hwnd, NULL, FALSE);
+            } else if (g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
+                g_state = (g_state == STATE_BENCHMARK_RESULT) ? STATE_BENCHMARK_MENU : STATE_MENU;
+                g_selectedButton = -1;
                 InvalidateRect(g_hwnd, NULL, FALSE);
             }
             break;
@@ -1243,8 +1785,12 @@ static void OnRawInput(HWND hwnd, HRAWINPUT hRawInput) {
         return;
     }
 
-    // In menu/keybinds/about — only left-click for UI navigation
-    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+    // Block mouse during benchmarks (ESC key is the only way out)
+    if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) return;
+
+    // In menu/keybinds/about/benchmark screens — only left-click for UI navigation
+    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+        || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
         if (btn == 0) {
             int btnId = HitTestButtons(g_mousePos.x, g_mousePos.y);
             if (btnId > 0) {
@@ -1348,7 +1894,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ToggleMenu();
             } else if (wParam == VK_F11) {
                 ToggleFullscreen(hwnd);
-            } else if ((g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) &&
+            } else if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) {
+                // Block all keys during benchmarks (only ESC/F11 above)
+            } else if ((g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+                        || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) &&
                        (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
                 // Menu navigation with arrow keys and Enter
                 if (wParam == VK_UP) {
@@ -1412,14 +1961,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create window
+    // Create window with 16:9 client area
+    DWORD dwStyle = WS_OVERLAPPEDWINDOW;
+    RECT wr = { 0, 0, 960, 540 };
+    AdjustWindowRect(&wr, dwStyle, FALSE);
     g_hwnd = CreateWindowExW(
         0,
         L"ReactionTimeClass",
         L"Reaction Time Tester",
-        WS_OVERLAPPEDWINDOW,
+        dwStyle,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        800, 600,
+        wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, hInstance, NULL
     );
 
@@ -1463,6 +2015,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             double elapsed = GetElapsedMs(g_tooEarlyTime);
             if (elapsed >= 2000) {
                 StartWaiting();
+            }
+        }
+
+        // Benchmark progress: continuous repaint + completion check
+        if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) {
+            InvalidateRect(g_hwnd, NULL, FALSE);
+            if (g_benchDone) {
+                double elapsed = (double)BENCH_DURATION_MS / 1000.0;
+                double score = (double)g_benchOps / elapsed / 1000000.0;
+                CloseHandle(g_benchThread);
+                g_benchThread = NULL;
+                g_lastBenchScore = score;
+                SaveBenchResult(g_lastBenchType, score);
+                LoadBenchHistory(g_lastBenchType);
+                g_state = STATE_BENCHMARK_RESULT;
+                g_selectedButton = -1;
+                InvalidateRect(g_hwnd, NULL, FALSE);
             }
         }
 
@@ -1548,9 +2117,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
 
                     if (pressed >= 0) {
-                        if (g_rebindingAction >= 0) {
+                        if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) {
+                            // Block gamepad during benchmarks (Start/ESC handled above)
+                        } else if (g_rebindingAction >= 0) {
                             CaptureRebind(BIND_GAMEPAD, pressed);
-                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+                                   || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
                             if (pressed == GAMEPAD_POV_UP) {
                                 NavigateMenu(-1);
                             } else if (pressed == GAMEPAD_POV_DOWN) {
@@ -1582,7 +2154,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                     // Thumbstick menu navigation
                     // XInput: positive Y = up, negative Y = down
-                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+                        || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
                         const SHORT deadzone = 16384;
                         int stickDir = 0;
                         SHORT ly = xstate.Gamepad.sThumbLY;
@@ -1636,9 +2209,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
 
                     if (pressed >= 0) {
-                        if (g_rebindingAction >= 0) {
+                        if (g_state == STATE_BENCHMARK_CPU || g_state == STATE_BENCHMARK_GPU || g_state == STATE_BENCHMARK_MULTICORE) {
+                            // Block gamepad during benchmarks (Start handled above)
+                        } else if (g_rebindingAction >= 0) {
                             CaptureRebind(BIND_GAMEPAD, pressed);
-                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+                                   || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
                             if (pressed == GAMEPAD_POV_UP) {
                                 NavigateMenu(-1);
                             } else if (pressed == GAMEPAD_POV_DOWN) {
@@ -1669,7 +2245,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     g_prevJoyPOVDir = povDir;
 
                     // Thumbstick menu navigation (joyGetPosEx: 0-65535, center ~32768)
-                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT
+                        || g_state == STATE_BENCHMARK_MENU || g_state == STATE_BENCHMARK_RESULT) {
                         const DWORD deadzone = 16384;
                         const DWORD center = 32768;
                         int stickDir = 0;
