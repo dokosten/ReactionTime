@@ -11,10 +11,12 @@ A Windows application to test mouse click reaction time with high precision timi
 Requires Visual Studio 2022 Build Tools.
 
 ```batch
-cmd.exe /c "\"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cd /d I:\Projects\ReactionTime && rc /fo resource.res resource.rc && cl /O2 /EHsc /DNDEBUG /Fe:ReactionTime.exe main.cpp resource.res user32.lib gdi32.lib winmm.lib msimg32.lib shell32.lib /link /SUBSYSTEM:WINDOWS"
+cmd.exe /c "\"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat\" x64 >nul 2>&1 && cd /d I:\Projects\ReactionTime && if not exist build mkdir build && rc /fo build\resource.res resource.rc && cl /O2 /EHsc /DNDEBUG /Fo:build\ /Fe:build\ReactionTime.exe main.cpp build\resource.res user32.lib gdi32.lib winmm.lib msimg32.lib shell32.lib /link /SUBSYSTEM:WINDOWS"
 ```
 
 Or use `build.bat` / CMake.
+
+Build outputs go to `build/` (exe, obj, res). The `build/` directory is gitignored.
 
 ### Icon Generation
 
@@ -26,7 +28,7 @@ powershell -ExecutionPolicy Bypass -File generate_icon.ps1
 ## Run
 
 ```batch
-cmd.exe /c "start \"\" I:\Projects\ReactionTime\ReactionTime.exe"
+cmd.exe /c "start \"\" I:\Projects\ReactionTime\build\ReactionTime.exe"
 ```
 
 ## Features

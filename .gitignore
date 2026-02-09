@@ -7,6 +7,7 @@ nul
 # Build outputs
 *.exe
 *.obj
+*.res
 *.pdb
 *.ilk
 *.idb
