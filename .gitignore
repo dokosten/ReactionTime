@@ -1,6 +1,9 @@
 # Claude Code
 .claude/
 
+# Windows NUL device artifact
+nul
+
 # Build outputs
 *.exe
 *.obj

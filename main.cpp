@@ -64,6 +64,11 @@ static int g_joyId = -1;           // cached joystick ID, -1 = needs scan
 static DWORD g_joyScanTime = 0;    // last scan timestamp (GetTickCount)
 static DWORD g_prevJoyButtons = 0;
 static int g_prevJoyPOVDir = -1;   // -1=centered, 0=up, 1=right, 2=down, 3=left
+static int g_prevStickDir = 0;     // 0=center, -1=up, 1=down (edge detection for thumbsticks)
+static int g_joyStartButton = -1;  // detected Start/Menu/Options button index
+// Controller type enum for button name display
+enum JoyType { JOY_GENERIC = 0, JOY_XBOX = 1, JOY_PLAYSTATION = 2, JOY_SWITCH = 3 };
+static JoyType g_joyType = JOY_GENERIC;
 
 // Gamepad POV (D-pad) sentinel codes
 static const int GAMEPAD_POV_UP    = 0x100;
@@ -142,6 +147,7 @@ static void LoadKeybinds() {
 // UI state
 static POINT g_mousePos = {0, 0};
 static int g_hoveredButton = -1;
+static int g_selectedButton = -1;  // keyboard/gamepad selected button, -1 = none
 static UIButton g_buttons[16];
 static int g_buttonCount = 0;
 
@@ -345,19 +351,59 @@ static int POVToDirection(DWORD pov) {
 
 // Get display name for a gamepad button code
 static const char* GetGamepadButtonName(int code, char* buf, int bufSize) {
+    // D-pad directions (same across all controllers)
     switch (code) {
-        case GAMEPAD_POV_UP:    return "Gamepad D-Up";
-        case GAMEPAD_POV_RIGHT: return "Gamepad D-Right";
-        case GAMEPAD_POV_DOWN:  return "Gamepad D-Down";
-        case GAMEPAD_POV_LEFT:  return "Gamepad D-Left";
-        default:
-            if (code >= 0 && code < 32) {
-                snprintf(buf, bufSize, "Gamepad %d", code + 1);
-                return buf;
-            }
-            snprintf(buf, bufSize, "Gamepad ?%d", code);
-            return buf;
+        case GAMEPAD_POV_UP:    return "D-pad Up";
+        case GAMEPAD_POV_RIGHT: return "D-pad Right";
+        case GAMEPAD_POV_DOWN:  return "D-pad Down";
+        case GAMEPAD_POV_LEFT:  return "D-pad Left";
     }
+
+    // Digital button names per controller type
+    // Xbox (DirectInput): A B X Y LB RB Back Start LS RS
+    static const char* xboxNames[] = {
+        "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "LS", "RS"
+    };
+    // PlayStation (DirectInput): Square Cross Circle Triangle L1 R1 L2 R2 Share Options L3 R3 PS Touchpad
+    static const char* psNames[] = {
+        "Square", "Cross", "Circle", "Triangle", "L1", "R1", "L2", "R2",
+        "Share", "Options", "L3", "R3", "PS", "Touchpad"
+    };
+    // Switch Pro (DirectInput): B A X Y L R ZL ZR - + LS RS Home Capture
+    static const char* switchNames[] = {
+        "B", "A", "X", "Y", "L", "R", "ZL", "ZR", "-", "+", "LS", "RS", "Home", "Capture"
+    };
+
+    const char** names = NULL;
+    int nameCount = 0;
+    switch (g_joyType) {
+        case JOY_XBOX:
+            names = xboxNames;
+            nameCount = sizeof(xboxNames) / sizeof(xboxNames[0]);
+            break;
+        case JOY_PLAYSTATION:
+            names = psNames;
+            nameCount = sizeof(psNames) / sizeof(psNames[0]);
+            break;
+        case JOY_SWITCH:
+            names = switchNames;
+            nameCount = sizeof(switchNames) / sizeof(switchNames[0]);
+            break;
+        default:
+            break;
+    }
+
+    if (names && code >= 0 && code < nameCount) {
+        return names[code];
+    }
+
+    // Fallback for unknown controller type or out-of-range button
+    if (code >= 0 && code < 32) {
+        snprintf(buf, bufSize, "Button %d", code + 1);
+        return buf;
+    }
+    snprintf(buf, bufSize, "Button ?%d", code);
+    return buf;
 }
 
 // Get display name for a unified input binding
@@ -442,8 +488,8 @@ static void DrawButton(HDC hdc, int centerX, int y, int width, int height,
         g_buttonCount++;
     }
 
-    // Determine if hovered
-    bool hovered = (g_hoveredButton == id);
+    // Determine if hovered (mouse) or selected (keyboard/gamepad)
+    bool hovered = (g_hoveredButton == id) || (g_selectedButton == id);
 
     // Draw rounded rect background
     COLORREF btnColor = hovered ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
@@ -499,6 +545,95 @@ static void UpdateHoveredButton() {
         g_hoveredButton = newHovered;
         InvalidateRect(g_hwnd, NULL, FALSE);
     }
+}
+
+// Forward declaration
+static void OnButtonClick(int id);
+
+// Get ordered list of button IDs for the current menu state
+static int GetMenuButtonIds(int* ids, int maxIds) {
+    int count = 0;
+    switch (g_state) {
+        case STATE_MENU:
+            if (count < maxIds) ids[count++] = BTN_KEYBINDS;
+            if (count < maxIds) ids[count++] = BTN_ABOUT;
+            if (count < maxIds) ids[count++] = BTN_QUIT;
+            if (count < maxIds) ids[count++] = BTN_CLOSE;
+            break;
+        case STATE_KEYBINDS:
+            if (count < maxIds) ids[count++] = BTN_REBIND_RESET;
+            if (count < maxIds) ids[count++] = BTN_REBIND_CLICK;
+            if (count < maxIds) ids[count++] = BTN_BACK;
+            break;
+        case STATE_ABOUT:
+            if (count < maxIds) ids[count++] = BTN_BACK;
+            break;
+        default:
+            break;
+    }
+    return count;
+}
+
+// Navigate menu selection up (-1) or down (+1)
+static void NavigateMenu(int direction) {
+    int ids[16];
+    int count = GetMenuButtonIds(ids, 16);
+    if (count == 0) return;
+
+    if (g_selectedButton == -1) {
+        // Nothing selected: pick first (down) or last (up)
+        g_selectedButton = (direction > 0) ? ids[0] : ids[count - 1];
+    } else {
+        // Find current index
+        int idx = -1;
+        for (int i = 0; i < count; i++) {
+            if (ids[i] == g_selectedButton) { idx = i; break; }
+        }
+        if (idx < 0) {
+            g_selectedButton = ids[0];
+        } else {
+            int newIdx = idx + direction;
+            if (newIdx < 0) newIdx = 0;
+            if (newIdx >= count) newIdx = count - 1;
+            g_selectedButton = ids[newIdx];
+        }
+    }
+    g_hoveredButton = -1;  // clear mouse hover to avoid dual-highlight
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// Activate the currently selected button
+static void ActivateSelectedButton() {
+    if (g_selectedButton > 0) {
+        OnButtonClick(g_selectedButton);
+    }
+}
+
+// Toggle menu open/close (same behavior as ESC key)
+static void ToggleMenu() {
+    if (g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+        g_state = STATE_MENU;
+        g_selectedButton = -1;
+        g_rebindingAction = -1;
+    } else if (g_state == STATE_MENU) {
+        if (g_stateBeforeMenu == STATE_WAITING || g_stateBeforeMenu == STATE_READY) {
+            g_state = STATE_START;
+            g_timerStarted = false;
+        } else {
+            g_state = g_stateBeforeMenu;
+        }
+    } else {
+        g_stateBeforeMenu = g_state;
+        g_state = STATE_MENU;
+        g_selectedButton = -1;
+        g_timerStarted = false;
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// Check if a gamepad button index is the Start/Menu/Options button
+static bool IsGamepadStartButton(int btn) {
+    return g_joyStartButton >= 0 && btn == g_joyStartButton;
 }
 
 // Create app icon using GDI (red circle with white "RT")
@@ -672,7 +807,7 @@ static void OnPaint(HWND hwnd) {
             DrawButton(memDC, centerX, startY + 3 * (btnH + gap), btnW, btnH, "CLOSE", BTN_CLOSE, btnFont);
 
             // Hint
-            DrawCenteredText(memDC, "Press ESC to return", ch - 60, smallFont, RGB(120, 120, 130));
+            DrawCenteredText(memDC, "ESC = Return  |  Arrows/D-pad = Navigate  |  Enter/Gamepad = Select", ch - 60, smallFont, RGB(120, 120, 130));
         }
         break;
 
@@ -712,7 +847,7 @@ static void OnPaint(HWND hwnd) {
             if (g_rebindingAction >= 0) {
                 DrawCenteredText(memDC, "ESC to cancel", ch - 60, smallFont, RGB(120, 120, 130));
             } else {
-                DrawCenteredText(memDC, "Click a binding to change it", ch - 60, smallFont, RGB(120, 120, 130));
+                DrawCenteredText(memDC, "Click or press Enter to change a binding", ch - 60, smallFont, RGB(120, 120, 130));
             }
         }
         break;
@@ -911,6 +1046,7 @@ static void OnPaint(HWND hwnd) {
 
 // Handle a UI button click by id
 static void OnButtonClick(int id) {
+    g_selectedButton = -1;  // reset selection on any button activation
     switch (id) {
         case BTN_KEYBINDS:
             g_state = STATE_KEYBINDS;
@@ -1110,6 +1246,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             pt.y = (short)HIWORD(lParam);
             ClientToScreen(hwnd, &pt);
             g_mousePos = pt;
+            g_selectedButton = -1;  // mouse takes over highlight
             UpdateHoveredButton();
         }
         return 0;
@@ -1133,26 +1270,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
 
             if (wParam == VK_ESCAPE) {
-                if (g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
-                    g_state = STATE_MENU;
-                    g_rebindingAction = -1;
-                    InvalidateRect(hwnd, NULL, FALSE);
-                } else if (g_state == STATE_MENU) {
-                    if (g_stateBeforeMenu == STATE_WAITING || g_stateBeforeMenu == STATE_READY) {
-                        g_state = STATE_START;
-                        g_timerStarted = false;
-                    } else {
-                        g_state = g_stateBeforeMenu;
-                    }
-                    InvalidateRect(hwnd, NULL, FALSE);
-                } else {
-                    g_stateBeforeMenu = g_state;
-                    g_state = STATE_MENU;
-                    g_timerStarted = false;
-                    InvalidateRect(hwnd, NULL, FALSE);
-                }
+                ToggleMenu();
             } else if (wParam == VK_F11) {
                 ToggleFullscreen(hwnd);
+            } else if ((g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) &&
+                       (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
+                // Menu navigation with arrow keys and Enter
+                if (wParam == VK_UP) {
+                    NavigateMenu(-1);
+                } else if (wParam == VK_DOWN) {
+                    NavigateMenu(1);
+                } else if (wParam == VK_RETURN) {
+                    ActivateSelectedButton();
+                }
             } else {
                 // Check both bindings against keyboard input
                 if (BindingMatches(g_bindReset, BIND_KEYBOARD, (int)wParam))
@@ -1274,17 +1404,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     probe.dwFlags = JOY_RETURNBUTTONS;
                     if (joyGetPosEx(i, &probe) == JOYERR_NOERROR) {
                         g_joyId = (int)i;
-                        g_prevJoyButtons = probe.dwButtons;  // init to current state
+                        g_prevJoyButtons = probe.dwButtons;
                         g_prevJoyPOVDir = -1;
+                        // Detect controller type for correct Start button mapping
+                        // Xbox (DirectInput): button 7 = Start/Menu
+                        // PlayStation/Switch (DirectInput): button 9 = Options/+
+                        JOYCAPSA caps = {};
+                        g_joyType = JOY_GENERIC;
+                        g_joyStartButton = 9;  // default to PS/Switch mapping
+                        if (joyGetDevCapsA(i, &caps, sizeof(caps)) == JOYERR_NOERROR) {
+                            if (strstr(caps.szPname, "Xbox") || strstr(caps.szPname, "xbox") ||
+                                strstr(caps.szPname, "XBOX") || strstr(caps.szPname, "X-Box")) {
+                                g_joyType = JOY_XBOX;
+                                g_joyStartButton = 7;
+                            } else if (strstr(caps.szPname, "Pro Controller") ||
+                                       strstr(caps.szPname, "Nintendo") || strstr(caps.szPname, "Joy-Con")) {
+                                g_joyType = JOY_SWITCH;
+                            } else {
+                                // Default to PlayStation for DualShock/DualSense ("Wireless Controller" etc.)
+                                g_joyType = JOY_PLAYSTATION;
+                            }
+                        }
                         break;
                     }
                 }
+                // Repaint so button names update with detected controller type
+                if (g_joyId >= 0) InvalidateRect(g_hwnd, NULL, FALSE);
             }
 
             if (g_joyId >= 0) {
                 JOYINFOEX joyInfo = {};
                 joyInfo.dwSize = sizeof(JOYINFOEX);
-                joyInfo.dwFlags = JOY_RETURNBUTTONS | JOY_RETURNPOV;
+                joyInfo.dwFlags = JOY_RETURNBUTTONS | JOY_RETURNPOV | JOY_RETURNY | JOY_RETURNR;
                 MMRESULT joyResult = joyGetPosEx((UINT)g_joyId, &joyInfo);
                 if (joyResult == JOYERR_NOERROR) {
                     DWORD buttons = joyInfo.dwButtons;
@@ -1303,9 +1454,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         pressed = GAMEPAD_POV_UP + povDir;  // 0x100 + 0..3
                     }
 
+                    // Check for Start/Menu/Options button to toggle menu (like ESC)
+                    bool startPressed = (g_joyStartButton >= 0 && (newButtons & (1u << g_joyStartButton)) != 0);
+                    if (startPressed && g_rebindingAction < 0) {
+                        ToggleMenu();
+                        // Remove start from newButtons so it doesn't also trigger bindings
+                        newButtons &= ~(1u << g_joyStartButton);
+                    }
+
                     if (pressed >= 0) {
                         if (g_rebindingAction >= 0) {
                             CaptureRebind(BIND_GAMEPAD, pressed);
+                        } else if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                            // Menu navigation: D-pad Up/Down to navigate, any other button to activate
+                            if (pressed == GAMEPAD_POV_UP) {
+                                NavigateMenu(-1);
+                            } else if (pressed == GAMEPAD_POV_DOWN) {
+                                NavigateMenu(1);
+                            } else if (!IsGamepadStartButton(pressed)) {
+                                ActivateSelectedButton();
+                            }
                         } else {
                             // Check all new digital buttons
                             if (newButtons) {
@@ -1329,11 +1497,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                     g_prevJoyButtons = buttons;
                     g_prevJoyPOVDir = povDir;
+
+                    // Thumbstick menu navigation (left stick Y = dwYpos, right stick Y = dwRpos)
+                    // joyGetPosEx axes range 0-65535, center ~32768
+                    if (g_state == STATE_MENU || g_state == STATE_KEYBINDS || g_state == STATE_ABOUT) {
+                        const DWORD deadzone = 16384;  // ~25% of half-range
+                        const DWORD center = 32768;
+                        int stickDir = 0;
+                        // Left stick Y (dwYpos) or right stick Y (dwRpos)
+                        if (joyInfo.dwYpos < center - deadzone || joyInfo.dwRpos < center - deadzone)
+                            stickDir = -1;  // up
+                        else if (joyInfo.dwYpos > center + deadzone || joyInfo.dwRpos > center + deadzone)
+                            stickDir = 1;   // down
+                        if (stickDir != 0 && stickDir != g_prevStickDir) {
+                            NavigateMenu(stickDir);
+                        }
+                        g_prevStickDir = stickDir;
+                    } else {
+                        g_prevStickDir = 0;
+                    }
                 } else {
                     // Controller disconnected — rescan next cycle
                     g_joyId = -1;
                     g_prevJoyButtons = 0;
                     g_prevJoyPOVDir = -1;
+                    g_prevStickDir = 0;
+                    g_joyStartButton = -1;
+                    g_joyType = JOY_GENERIC;
                 }
             }
         }
