@@ -1064,7 +1064,7 @@ static void OnPaint(HWND hwnd) {
 
     // Version text (top-right corner, subtle)
     {
-        const char* version = "v0.1";
+        const char* version = "v0.2";
         SelectObject(memDC, smallFont);
         SetTextColor(memDC, RGB(255, 255, 255));
         SetBkMode(memDC, TRANSPARENT);
