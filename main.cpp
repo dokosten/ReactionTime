@@ -1588,7 +1588,7 @@ static void OnPaint(HWND hwnd) {
 
     // Version text (top-right corner, subtle)
     {
-        const char* version = "v0.5";
+        const char* version = "v0.61";
         SelectObject(memDC, smallFont);
         SetTextColor(memDC, RGB(255, 255, 255));
         SetBkMode(memDC, TRANSPARENT);
@@ -1872,6 +1872,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+        case WM_SYSKEYDOWN:
+            if (wParam == VK_RETURN) {
+                ToggleFullscreen(hwnd);
+                return 0;
+            }
+            break;
+
         case WM_KEYDOWN:
             // If rebinding, capture keypress (any action)
             if (g_rebindingAction >= 0) {
@@ -1941,9 +1948,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Seed random number generator
     srand((unsigned int)time(NULL));
 
-    // Create runtime icons
-    HICON iconLarge = CreateAppIcon(48);
-    HICON iconSmall = CreateAppIcon(16);
+    // Load icons from embedded resource (resource ID 1 in resource.rc)
+    HICON iconLarge = (HICON)LoadImageA(hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON, 48, 48, 0);
+    HICON iconSmall = (HICON)LoadImageA(hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON, 16, 16, 0);
 
     // Register window class
     WNDCLASSEXW wc = {0};
